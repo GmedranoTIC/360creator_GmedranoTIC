@@ -26,6 +26,11 @@ const Viewer: React.FC<ViewerProps> = ({ scene, onAddHotspot, onHotspotClick, se
   const onPointerDownLon = useRef(0);
   const onPointerDownLat = useRef(0);
 
+  // Sync hotspots refs
+  useEffect(() => {
+    hotspotsRef.current = [];
+  }, [scene.hotspots]);
+
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -44,11 +49,39 @@ const Viewer: React.FC<ViewerProps> = ({ scene, onAddHotspot, onHotspotClick, se
 
     const geometry = new THREE.SphereGeometry(500, 60, 40);
     geometry.scale(-1, 1, 1);
-    const material = new THREE.MeshBasicMaterial();
+    
+    // We use BackSide so we can see it from within, and raycasting works on the inside.
+    const material = new THREE.MeshBasicMaterial({ side: THREE.BackSide });
     const sphere = new THREE.Mesh(geometry, material);
     sceneThree.add(sphere);
     sphereRef.current = sphere;
 
+    const updateHotspotPositions = () => {
+      if (!cameraRef.current || !containerRef.current) return;
+      
+      const w = containerRef.current.clientWidth;
+      const h = containerRef.current.clientHeight;
+
+      hotspotsRef.current.forEach((el) => {
+        if (!el) return;
+        const hs = (el as any).userData as Hotspot;
+        if (!hs) return;
+        const pos = new THREE.Vector3(hs.position.x, hs.position.y, hs.position.z);
+        pos.project(cameraRef.current!);
+
+        if (pos.z > 1) {
+          el.style.display = 'none';
+        } else {
+          const x = (pos.x * 0.5 + 0.5) * w;
+          const y = (pos.y * -0.5 + 0.5) * h;
+          el.style.display = 'flex';
+          el.style.left = `${x}px`;
+          el.style.top = `${y}px`;
+        }
+      });
+    };
+
+    let animationFrameId: number;
     const animate = () => {
       if (!rendererRef.current || !cameraRef.current) return;
       
@@ -63,30 +96,7 @@ const Viewer: React.FC<ViewerProps> = ({ scene, onAddHotspot, onHotspotClick, se
       cameraRef.current.lookAt(x, y, z);
       rendererRef.current.render(sceneThree, cameraRef.current);
       updateHotspotPositions();
-      requestAnimationFrame(animate);
-    };
-
-    const updateHotspotPositions = () => {
-      if (!cameraRef.current || !containerRef.current) return;
-      
-      const width = containerRef.current.clientWidth;
-      const height = containerRef.current.clientHeight;
-
-      hotspotsRef.current.forEach((el) => {
-        const hs = (el as any).userData as Hotspot;
-        const pos = new THREE.Vector3(hs.position.x, hs.position.y, hs.position.z);
-        pos.project(cameraRef.current!);
-
-        if (pos.z > 1) {
-          el.style.display = 'none';
-        } else {
-          const x = (pos.x * 0.5 + 0.5) * width;
-          const y = (pos.y * -0.5 + 0.5) * height;
-          el.style.display = 'flex';
-          el.style.left = `${x}px`;
-          el.style.top = `${y}px`;
-        }
-      });
+      animationFrameId = requestAnimationFrame(animate);
     };
 
     const handlePointerDown = (e: PointerEvent) => {
@@ -100,8 +110,8 @@ const Viewer: React.FC<ViewerProps> = ({ scene, onAddHotspot, onHotspotClick, se
 
     const handlePointerMove = (e: PointerEvent) => {
       if (!isInteracting.current) return;
-      lon.current = (onPointerDownMouseX.current - e.clientX) * 0.1 + onPointerDownLon.current;
-      lat.current = (e.clientY - onPointerDownMouseY.current) * 0.1 + onPointerDownLat.current;
+      lon.current = (onPointerDownMouseX.current - e.clientX) * 0.15 + onPointerDownLon.current;
+      lat.current = (e.clientY - onPointerDownMouseY.current) * 0.15 + onPointerDownLat.current;
     };
 
     const handlePointerUp = (e: PointerEvent) => {
@@ -111,16 +121,21 @@ const Viewer: React.FC<ViewerProps> = ({ scene, onAddHotspot, onHotspotClick, se
       const moveX = Math.abs(e.clientX - onPointerDownMouseX.current);
       const moveY = Math.abs(e.clientY - onPointerDownMouseY.current);
       
-      if (moveX < 5 && moveY < 5 && !isPreviewMode) {
-        if (!rendererRef.current || !cameraRef.current || !containerRef.current) return;
+      // If the movement was minimal, consider it a click to add a hotspot
+      if (moveX < 10 && moveY < 10 && !isPreviewMode) {
+        if (!rendererRef.current || !cameraRef.current || !containerRef.current || !sphereRef.current) return;
+        
         const rect = containerRef.current.getBoundingClientRect();
         const mouse = new THREE.Vector2(
           ((e.clientX - rect.left) / rect.width) * 2 - 1,
           -((e.clientY - rect.top) / rect.height) * 2 + 1
         );
+        
         const raycaster = new THREE.Raycaster();
         raycaster.setFromCamera(mouse, cameraRef.current);
-        const intersects = raycaster.intersectObject(sphereRef.current!);
+        
+        // Sphere is scaled -1, so we are inside. Raycasting still works.
+        const intersects = raycaster.intersectObject(sphereRef.current);
         if (intersects.length > 0) {
           onAddHotspot(intersects[0].point);
         }
@@ -129,7 +144,7 @@ const Viewer: React.FC<ViewerProps> = ({ scene, onAddHotspot, onHotspotClick, se
 
     const handleWheel = (e: WheelEvent) => {
       if (!cameraRef.current) return;
-      cameraRef.current.fov = THREE.MathUtils.clamp(cameraRef.current.fov + e.deltaY * 0.05, 10, 75);
+      cameraRef.current.fov = THREE.MathUtils.clamp(cameraRef.current.fov + e.deltaY * 0.05, 20, 90);
       cameraRef.current.updateProjectionMatrix();
     };
 
@@ -142,36 +157,44 @@ const Viewer: React.FC<ViewerProps> = ({ scene, onAddHotspot, onHotspotClick, se
       rendererRef.current.setSize(w, h);
     };
 
-    containerRef.current.addEventListener('pointerdown', handlePointerDown);
+    const element = containerRef.current;
+    element.addEventListener('pointerdown', handlePointerDown);
     window.addEventListener('pointermove', handlePointerMove);
     window.addEventListener('pointerup', handlePointerUp);
-    containerRef.current.addEventListener('wheel', handleWheel);
+    element.addEventListener('wheel', handleWheel);
     window.addEventListener('resize', handleResize);
 
     animate();
 
     return () => {
+      cancelAnimationFrame(animationFrameId);
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', handlePointerUp);
       window.removeEventListener('resize', handleResize);
+      if (element) {
+        element.removeEventListener('pointerdown', handlePointerDown);
+        element.removeEventListener('wheel', handleWheel);
+      }
       renderer.dispose();
-      if (containerRef.current) containerRef.current.innerHTML = '';
+      if (element) element.innerHTML = '';
     };
-  }, [isPreviewMode]);
+  }, [isPreviewMode, onAddHotspot]); // Re-init only when essential props change
 
+  // Texture loading
   useEffect(() => {
     if (!sphereRef.current || !scene.imageSource) return;
     const loader = new THREE.TextureLoader();
     loader.load(scene.imageSource, (texture) => {
       if (sphereRef.current) {
-        (sphereRef.current.material as THREE.MeshBasicMaterial).map = texture;
-        (sphereRef.current.material as THREE.MeshBasicMaterial).needsUpdate = true;
+        const mat = sphereRef.current.material as THREE.MeshBasicMaterial;
+        mat.map = texture;
+        mat.needsUpdate = true;
       }
     });
   }, [scene.imageSource]);
 
   return (
-    <div ref={containerRef} className="w-full h-full bg-black relative overflow-hidden">
+    <div ref={containerRef} className="w-full h-full bg-black relative overflow-hidden touch-none">
       {scene.hotspots.map((hs) => (
         <div
           key={hs.id}
@@ -190,7 +213,7 @@ const Viewer: React.FC<ViewerProps> = ({ scene, onAddHotspot, onHotspotClick, se
           <span className="text-white text-lg">
             {hs.type === HotspotType.SCENE ? '🚪' : hs.type === HotspotType.LINK ? '🔗' : '🖼️'}
           </span>
-          <div className="absolute top-12 opacity-0 group-hover:opacity-100 bg-slate-900 text-white text-[10px] font-bold px-2 py-1 rounded whitespace-nowrap pointer-events-none transition-opacity uppercase tracking-wider">
+          <div className="absolute top-12 opacity-0 group-hover:opacity-100 bg-slate-900/90 backdrop-blur-md text-white text-[10px] font-bold px-2.5 py-1.5 rounded-lg whitespace-nowrap pointer-events-none transition-all uppercase tracking-wider border border-white/10 shadow-xl">
             {hs.label}
           </div>
         </div>

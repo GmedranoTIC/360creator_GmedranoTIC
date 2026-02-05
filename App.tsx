@@ -1,12 +1,13 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Scene, Tour, Hotspot, HotspotType } from './types';
 import Viewer from './components/Viewer';
 import EditorSidebar from './components/EditorSidebar';
 import HotspotPanel from './components/HotspotPanel';
 import { exportTourAsHTML } from './utils/exportTour';
 import { db } from './utils/db';
-import { Plus, Download, Eye, Edit3, Image as ImageIcon, FolderOpen, Save, ShieldAlert, Trash2, Info, AlertTriangle } from 'lucide-react';
+import JSZip from 'jszip';
+import { Plus, Download, Eye, Edit3, Image as ImageIcon, FileArchive, Save, Trash2, Info, Upload } from 'lucide-react';
 
 const App: React.FC = () => {
   const [tour, setTour] = useState<Tour>({
@@ -17,23 +18,13 @@ const App: React.FC = () => {
   const [activeSceneId, setActiveSceneId] = useState<string>('');
   const [selectedHotspotId, setSelectedHotspotId] = useState<string | null>(null);
   const [isPreviewMode, setIsPreviewMode] = useState<boolean>(false);
-  const [directoryHandle, setDirectoryHandle] = useState<any | null>(null);
   const [isDirty, setIsDirty] = useState(false);
-  const [isSecureContext, setIsSecureContext] = useState(true);
-  const [isFileSystemSupported, setIsFileSystemSupported] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
 
   const activeScene = tour.scenes.find((s) => s.id === activeSceneId);
   const selectedHotspot = activeScene?.hotspots.find((h) => h.id === selectedHotspotId);
 
   useEffect(() => {
-    // Check if we are in a secure context (localhost or HTTPS)
-    const secure = window.isSecureContext;
-    const fsSupported = 'showDirectoryPicker' in window;
-    
-    setIsSecureContext(secure);
-    setIsFileSystemSupported(fsSupported);
-    
-    // Auto-load last project from IndexedDB on startup
     loadFromBrowserStorage();
   }, []);
 
@@ -45,127 +36,117 @@ const App: React.FC = () => {
         if (savedTour.scenes.length > 0) setActiveSceneId(savedTour.scenes[0].id);
       }
     } catch (e) {
-      console.error("Failed to load from browser storage", e);
+      console.error("Failed to auto-load", e);
     }
   };
 
-  const getFileUrl = async (dirHandle: any, fileName: string) => {
+  const saveToZip = async () => {
     try {
-      const fileHandle = await dirHandle.getFileHandle(fileName);
-      const file = await fileHandle.getFile();
-      return URL.createObjectURL(file);
-    } catch (e) {
-      console.error(`Could not load file: ${fileName}`, e);
-      return '';
-    }
-  };
-
-  const openProjectFolder = async () => {
-    if (!isFileSystemSupported || !isSecureContext) {
-      alert("Local folder access is only available on 'localhost' or 'HTTPS'. Using browser storage instead.");
-      return;
-    }
-
-    try {
-      const handle = await (window as any).showDirectoryPicker({ mode: 'readwrite' });
-      setDirectoryHandle(handle);
-
-      try {
-        const fileHandle = await handle.getFileHandle('tour.json');
-        const file = await fileHandle.getFile();
-        const text = await file.text();
-        const savedTour: Tour = JSON.parse(text);
-
-        // Re-generate blob URLs for the current session
-        const hydratedScenes = await Promise.all(
-          savedTour.scenes.map(async (s) => ({
-            ...s,
-            imageSource: await getFileUrl(handle, s.imageFileName)
-          }))
-        );
-
-        setTour({ ...savedTour, scenes: hydratedScenes });
-        if (hydratedScenes.length > 0) setActiveSceneId(hydratedScenes[0].id);
-        setIsDirty(false);
-      } catch (e) {
-        console.log("No tour.json found in folder. Starting new project in this directory.");
-      }
-    } catch (e) {
-      console.error("Directory picker failed", e);
-    }
-  };
-
-  const saveProject = async () => {
-    try {
-      // 1. Try saving to real folder if connected
-      if (directoryHandle) {
-        const fileHandle = await directoryHandle.getFileHandle('tour.json', { create: true });
-        const writable = await fileHandle.createWritable();
-        // Remove large image blobs from JSON before saving to file
-        const tourToSave = {
-          ...tour,
-          scenes: tour.scenes.map(({ imageSource, ...rest }) => rest)
-        };
-        await writable.write(JSON.stringify(tourToSave, null, 2));
-        await writable.close();
-      }
+      setIsLoading(true);
+      const zip = new JSZip();
       
-      // 2. Always save to IndexedDB (Browser Storage) to allow saving while editing
-      await db.save('current-tour', tour);
-      
-      setIsDirty(false);
-      alert("Project saved locally!");
-    } catch (e) {
-      console.error("Save failed", e);
-      alert("Save failed. If using a folder, ensure you accepted write permissions.");
-    }
-  };
-
-  const addScene = async (file: File) => {
-    try {
-      const imageSource = URL.createObjectURL(file);
-      
-      // If a folder is connected, try to physically copy the image there
-      if (directoryHandle) {
-        try {
-          const fileHandle = await directoryHandle.getFileHandle(file.name, { create: true });
-          const writable = await fileHandle.createWritable();
-          await writable.write(file);
-          await writable.close();
-        } catch (err) {
-          console.warn("Folder write failed, image stays in session only", err);
+      // Separate images from the JSON to save them as actual files in the zip
+      const cleanScenes = await Promise.all(tour.scenes.map(async (scene) => {
+        const { imageSource, ...rest } = scene;
+        if (imageSource) {
+          const response = await fetch(imageSource);
+          const blob = await response.blob();
+          zip.file(`images/${scene.imageFileName}`, blob);
         }
-      }
+        return rest;
+      }));
 
-      const newScene: Scene = {
-        id: crypto.randomUUID(),
-        name: file.name.split('.')[0],
-        imageFileName: file.name,
-        imageSource: imageSource,
-        hotspots: [],
-      };
+      const projectJson = { ...tour, scenes: cleanScenes };
+      zip.file('project.json', JSON.stringify(projectJson, null, 2));
 
-      setTour((prev) => ({
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(content);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${tour.title.replace(/\s+/g, '_')}_project.pano`;
+      a.click();
+      URL.revokeObjectURL(url);
+      
+      // Also cache in IndexedDB
+      await db.save('current-tour', tour);
+      setIsDirty(false);
+    } catch (e) {
+      console.error("ZIP export failed", e);
+      alert("Failed to create project file.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const loadFromZip = async (file: File) => {
+    try {
+      setIsLoading(true);
+      const zip = await JSZip.loadAsync(file);
+      const jsonFile = zip.file('project.json');
+      if (!jsonFile) throw new Error("Not a valid project file (missing project.json)");
+
+      const jsonText = await jsonFile.async('string');
+      const loadedTour: Tour = JSON.parse(jsonText);
+
+      // Restore images
+      const hydratedScenes = await Promise.all(loadedTour.scenes.map(async (scene) => {
+        const imgFile = zip.file(`images/${scene.imageFileName}`);
+        if (imgFile) {
+          const blob = await imgFile.async('blob');
+          return { ...scene, imageSource: URL.createObjectURL(blob) };
+        }
+        return scene;
+      }));
+
+      const finalTour = { ...loadedTour, scenes: hydratedScenes };
+      setTour(finalTour);
+      if (finalTour.scenes.length > 0) setActiveSceneId(finalTour.scenes[0].id);
+      setIsDirty(false);
+      await db.save('current-tour', finalTour);
+    } catch (e) {
+      console.error("ZIP import failed", e);
+      alert("Error loading project file. Is it a .pano file?");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const addScene = useCallback(async (file: File) => {
+    const imageSource = URL.createObjectURL(file);
+    const newScene: Scene = {
+      id: crypto.randomUUID(),
+      name: file.name.split('.')[0],
+      imageFileName: file.name,
+      imageSource: imageSource,
+      hotspots: [],
+    };
+
+    setTour((prev) => {
+      const updated = {
         ...prev,
         scenes: [...prev.scenes, newScene],
         startSceneId: prev.startSceneId || newScene.id,
-      }));
-      setActiveSceneId(newScene.id);
-      setIsDirty(true);
-    } catch (e) {
-      console.error("Failed to add scene", e);
-    }
-  };
+      };
+      db.save('current-tour', updated);
+      return updated;
+    });
+    setActiveSceneId(newScene.id);
+    setIsDirty(true);
+  }, []);
 
   const updateHotspot = (updated: Hotspot) => {
-    setTour((prev) => ({
-      ...prev,
-      scenes: prev.scenes.map((s) =>
-        s.id === activeSceneId
-          ? { ...s, hotspots: s.hotspots.map((h) => (h.id === updated.id ? updated : h)) }
-          : s
-      ),
-    }));
+    setTour((prev) => {
+      const next = {
+        ...prev,
+        scenes: prev.scenes.map((s) =>
+          s.id === activeSceneId
+            ? { ...s, hotspots: s.hotspots.map((h) => (h.id === updated.id ? updated : h)) }
+            : s
+        ),
+      };
+      db.save('current-tour', next);
+      return next;
+    });
     setIsDirty(true);
   };
 
@@ -173,11 +154,13 @@ const App: React.FC = () => {
     if (!confirm("Remove this scene?")) return;
     setTour((prev) => {
       const nextScenes = prev.scenes.filter((s) => s.id !== id);
-      return {
+      const updated = {
         ...prev,
         scenes: nextScenes,
         startSceneId: prev.startSceneId === id ? (nextScenes[0]?.id || '') : prev.startSceneId,
       };
+      db.save('current-tour', updated);
+      return updated;
     });
     if (activeSceneId === id) {
       setActiveSceneId(tour.scenes.find((s) => s.id !== id)?.id || '');
@@ -196,23 +179,31 @@ const App: React.FC = () => {
       targetUrl: '',
       contentImageUrl: '',
     };
-    setTour((prev) => ({
-      ...prev,
-      scenes: prev.scenes.map((s) =>
-        s.id === activeSceneId ? { ...s, hotspots: [...s.hotspots, newHotspot] } : s
-      ),
-    }));
+    setTour((prev) => {
+      const updated = {
+        ...prev,
+        scenes: prev.scenes.map((s) =>
+          s.id === activeSceneId ? { ...s, hotspots: [...s.hotspots, newHotspot] } : s
+        ),
+      };
+      db.save('current-tour', updated);
+      return updated;
+    });
     setSelectedHotspotId(newHotspot.id);
     setIsDirty(true);
   };
 
   const removeHotspot = (id: string) => {
-    setTour((prev) => ({
-      ...prev,
-      scenes: prev.scenes.map((s) =>
-        s.id === activeSceneId ? { ...s, hotspots: s.hotspots.filter((h) => h.id !== id) } : s
-      ),
-    }));
+    setTour((prev) => {
+      const updated = {
+        ...prev,
+        scenes: prev.scenes.map((s) =>
+          s.id === activeSceneId ? { ...s, hotspots: s.hotspots.filter((h) => h.id !== id) } : s
+        ),
+      };
+      db.save('current-tour', updated);
+      return updated;
+    });
     setSelectedHotspotId(null);
     setIsDirty(true);
   };
@@ -222,11 +213,10 @@ const App: React.FC = () => {
       <EditorSidebar
         tour={tour}
         activeSceneId={activeSceneId}
-        directoryHandle={directoryHandle}
-        onOpenFolder={openProjectFolder}
         onSelectScene={setActiveSceneId}
         onAddScene={addScene}
         onRemoveScene={removeScene}
+        onLoadProject={loadFromZip}
         onUpdateTourTitle={(title) => { setTour((prev) => ({ ...prev, title })); setIsDirty(true); }}
       />
 
@@ -246,11 +236,12 @@ const App: React.FC = () => {
           
           <div className="flex items-center gap-3">
             <button
-              onClick={saveProject}
-              className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg transition-all border border-slate-700 font-medium"
+              onClick={saveToZip}
+              disabled={isLoading}
+              className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg transition-all border border-slate-700 font-medium disabled:opacity-50"
             >
               <Save size={18} />
-              Save Project
+              {isLoading ? 'Processing...' : 'Save Project (.pano)'}
             </button>
             <div className="w-px h-6 bg-slate-800 mx-1" />
             <button
@@ -272,7 +263,7 @@ const App: React.FC = () => {
           </div>
         </header>
 
-        <main className="flex-1 relative overflow-hidden">
+        <main className="flex-1 relative overflow-hidden bg-black">
           {activeScene ? (
             <Viewer
               scene={activeScene}
@@ -291,25 +282,13 @@ const App: React.FC = () => {
           ) : (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950 p-8 text-center">
               <div className="max-w-md w-full p-10 bg-slate-900/50 rounded-[2.5rem] border border-slate-800 shadow-2xl backdrop-blur-xl">
-                {!isSecureContext && (
-                  <div className="flex flex-col items-center gap-3 p-4 bg-amber-500/10 border border-amber-500/20 rounded-2xl mb-8">
-                    <div className="flex items-center gap-2 text-amber-500 font-bold text-xs uppercase tracking-wider">
-                      <AlertTriangle size={16} />
-                      Limited Mode
-                    </div>
-                    <p className="text-[11px] text-slate-400">
-                      You are running from a local file (`file://`). Folder access is disabled. Your project will be saved in <b>Browser Storage</b> instead.
-                    </p>
-                  </div>
-                )}
-                
                 <div className="w-20 h-20 bg-blue-500/10 rounded-3xl flex items-center justify-center mx-auto mb-6 text-blue-500">
                   <ImageIcon size={40} />
                 </div>
                 
                 <h2 className="text-3xl font-black mb-4 tracking-tight">Virtual Tour Editor</h2>
                 <p className="text-slate-400 mb-10 leading-relaxed text-sm">
-                  Create immersive 360 experiences. Upload your first panorama to begin.
+                  Create immersive 360 experiences. No complex setup, works in your browser.
                 </p>
                 
                 <div className="flex flex-col gap-3">
@@ -324,16 +303,25 @@ const App: React.FC = () => {
                     />
                   </label>
                   
-                  {isSecureContext && isFileSystemSupported && !directoryHandle && (
-                    <button
-                      onClick={openProjectFolder}
-                      className="flex items-center justify-center gap-3 px-8 py-4 bg-slate-800 hover:bg-slate-700 rounded-2xl font-bold transition-all border border-slate-700"
-                    >
-                      <FolderOpen size={20} />
-                      Pick Local Folder
-                    </button>
-                  )}
+                  <label className="flex items-center justify-center gap-3 px-8 py-4 bg-slate-800 hover:bg-slate-700 rounded-2xl font-bold transition-all border border-slate-700 cursor-pointer">
+                    <Upload size={20} />
+                    Load .pano Project
+                    <input
+                      type="file"
+                      accept=".pano"
+                      className="hidden"
+                      onChange={(e) => e.target.files?.[0] && loadFromZip(e.target.files[0])}
+                    />
+                  </label>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {!isPreviewMode && activeScene && (
+            <div className="absolute bottom-6 left-1/2 -translate-x-1/2 pointer-events-none">
+              <div className="bg-slate-900/80 backdrop-blur-md border border-slate-700 px-4 py-2 rounded-full text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                Click on the image to add a hotspot
               </div>
             </div>
           )}

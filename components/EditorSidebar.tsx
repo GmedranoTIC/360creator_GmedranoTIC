@@ -1,27 +1,25 @@
 
 import React from 'react';
 import { Tour, Scene } from '../types';
-import { Plus, Trash2, Home, Map, FolderOpen, RefreshCcw } from 'lucide-react';
+import { Plus, Trash2, Home, Map, Upload, RefreshCcw } from 'lucide-react';
 
 interface EditorSidebarProps {
   tour: Tour;
   activeSceneId: string;
-  directoryHandle: any | null;
-  onOpenFolder: () => void;
   onSelectScene: (id: string) => void;
   onAddScene: (file: File) => void;
   onRemoveScene: (id: string) => void;
+  onLoadProject: (file: File) => void;
   onUpdateTourTitle: (title: string) => void;
 }
 
 const EditorSidebar: React.FC<EditorSidebarProps> = ({
   tour,
   activeSceneId,
-  directoryHandle,
-  onOpenFolder,
   onSelectScene,
   onAddScene,
   onRemoveScene,
+  onLoadProject,
   onUpdateTourTitle,
 }) => {
   return (
@@ -43,22 +41,20 @@ const EditorSidebar: React.FC<EditorSidebarProps> = ({
         
         <div className="mb-6">
           <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">
-            Storage Target
+            Project Actions
           </label>
-          {directoryHandle ? (
-            <div className="flex items-center justify-between bg-emerald-500/10 border border-emerald-500/20 rounded-lg px-3 py-2">
-              <span className="text-xs text-emerald-400 font-medium truncate flex items-center gap-2">
-                <FolderOpen size={14} />
-                {directoryHandle.name}
-              </span>
-              <button onClick={onOpenFolder} className="text-[10px] text-slate-400 hover:text-white underline font-bold">Switch</button>
-            </div>
-          ) : (
-            <div className="flex items-center justify-between bg-blue-500/5 border border-blue-500/10 rounded-lg px-3 py-2">
-              <span className="text-xs text-blue-400/70 font-medium">Browser Storage</span>
-              <button onClick={onOpenFolder} className="text-[10px] text-blue-400 hover:text-blue-300 underline font-bold">Pick Folder</button>
-            </div>
-          )}
+          <label className="flex items-center justify-between bg-blue-500/5 border border-blue-500/10 rounded-lg px-3 py-2 cursor-pointer hover:bg-blue-500/10 transition-colors">
+            <span className="text-xs text-blue-400 font-medium flex items-center gap-2">
+              <Upload size={14} />
+              Load .pano File
+            </span>
+            <input
+              type="file"
+              accept=".pano"
+              className="hidden"
+              onChange={(e) => e.target.files?.[0] && onLoadProject(e.target.files[0])}
+            />
+          </label>
         </div>
 
         <div>
@@ -137,7 +133,7 @@ const EditorSidebar: React.FC<EditorSidebarProps> = ({
       
       <div className="p-4 bg-slate-950/50 border-t border-slate-800">
         <div className="text-[9px] text-slate-600 text-center font-bold uppercase tracking-widest">
-          Panocraft Studio v1.2.0
+          Panocraft Studio v1.5.0
         </div>
       </div>
     </aside>
