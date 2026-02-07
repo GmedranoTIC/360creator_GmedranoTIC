@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Scene, Tour, Hotspot, HotspotType } from './types';
 import Viewer from './components/Viewer';
 import EditorSidebar from './components/EditorSidebar';
@@ -24,36 +24,52 @@ const App: React.FC = () => {
   const activeScene = tour.scenes.find((s) => s.id === activeSceneId);
   const selectedHotspot = activeScene?.hotspots.find((h) => h.id === selectedHotspotId);
 
+  // Load from IndexedDB on startup
   useEffect(() => {
-    loadFromBrowserStorage();
+    const init = async () => {
+      try {
+        const savedTour = await db.load('current-tour');
+        if (savedTour && savedTour.scenes && savedTour.scenes.length > 0) {
+          setTour(savedTour);
+          setActiveSceneId(savedTour.startSceneId || savedTour.scenes[0].id);
+        }
+      } catch (e) {
+        console.error("Auto-load failed", e);
+      }
+    };
+    init();
   }, []);
 
-  const loadFromBrowserStorage = async () => {
-    try {
-      const savedTour = await db.load('current-tour');
-      if (savedTour && savedTour.scenes) {
-        setTour(savedTour);
-        if (savedTour.scenes.length > 0) setActiveSceneId(savedTour.scenes[0].id);
-      }
-    } catch (e) {
-      console.error("Failed to auto-load", e);
-    }
-  };
-
+  // Save to ZIP (.pano)
   const saveToZip = async () => {
     try {
       setIsLoading(true);
       const zip = new JSZip();
       
-      // Separate images from the JSON to save them as actual files in the zip
       const cleanScenes = await Promise.all(tour.scenes.map(async (scene) => {
         const { imageSource, ...rest } = scene;
         if (imageSource) {
-          const response = await fetch(imageSource);
-          const blob = await response.blob();
-          zip.file(`images/${scene.imageFileName}`, blob);
+          try {
+            const response = await fetch(imageSource);
+            const blob = await response.blob();
+            zip.file(`images/${scene.imageFileName}`, blob);
+          } catch (e) {
+            console.warn(`Could not include image ${scene.imageFileName} in ZIP`, e);
+          }
         }
-        return rest;
+        
+        const updatedHotspots = await Promise.all(scene.hotspots.map(async (hs) => {
+          if (hs.type === HotspotType.IMAGE && hs.contentImageUrl && hs.contentImageUrl.startsWith('data:')) {
+             const res = await fetch(hs.contentImageUrl);
+             const blob = await res.blob();
+             const filename = `content_${hs.id}.jpg`;
+             zip.file(`images/${filename}`, blob);
+             return { ...hs, contentImageUrl: filename };
+          }
+          return hs;
+        }));
+
+        return { ...rest, hotspots: updatedHotspots };
       }));
 
       const projectJson = { ...tour, scenes: cleanScenes };
@@ -64,12 +80,14 @@ const App: React.FC = () => {
       const a = document.createElement('a');
       a.href = url;
       a.download = `${tour.title.replace(/\s+/g, '_')}_project.pano`;
+      document.body.appendChild(a);
       a.click();
+      document.body.removeChild(a);
       URL.revokeObjectURL(url);
       
-      // Also cache in IndexedDB
       await db.save('current-tour', tour);
       setIsDirty(false);
+      alert("Project saved successfully!");
     } catch (e) {
       console.error("ZIP export failed", e);
       alert("Failed to create project file.");
@@ -83,32 +101,52 @@ const App: React.FC = () => {
       setIsLoading(true);
       const zip = await JSZip.loadAsync(file);
       const jsonFile = zip.file('project.json');
-      if (!jsonFile) throw new Error("Not a valid project file (missing project.json)");
+      if (!jsonFile) throw new Error("Missing project.json in archive");
 
       const jsonText = await jsonFile.async('string');
       const loadedTour: Tour = JSON.parse(jsonText);
 
-      // Restore images
       const hydratedScenes = await Promise.all(loadedTour.scenes.map(async (scene) => {
         const imgFile = zip.file(`images/${scene.imageFileName}`);
+        let imageSource = '';
         if (imgFile) {
           const blob = await imgFile.async('blob');
-          return { ...scene, imageSource: URL.createObjectURL(blob) };
+          imageSource = URL.createObjectURL(blob);
         }
-        return scene;
+
+        const hydratedHotspots = await Promise.all(scene.hotspots.map(async (hs) => {
+          if (hs.type === HotspotType.IMAGE && hs.contentImageUrl && !hs.contentImageUrl.startsWith('data:')) {
+            const hsImgFile = zip.file(`images/${hs.contentImageUrl}`);
+            if (hsImgFile) {
+              const blob = await hsImgFile.async('blob');
+              return { ...hs, contentImageUrl: await blobToBase64(blob) };
+            }
+          }
+          return hs;
+        }));
+
+        return { ...scene, imageSource, hotspots: hydratedHotspots };
       }));
 
       const finalTour = { ...loadedTour, scenes: hydratedScenes };
       setTour(finalTour);
-      if (finalTour.scenes.length > 0) setActiveSceneId(finalTour.scenes[0].id);
+      if (finalTour.scenes.length > 0) setActiveSceneId(finalTour.startSceneId || finalTour.scenes[0].id);
       setIsDirty(false);
       await db.save('current-tour', finalTour);
     } catch (e) {
       console.error("ZIP import failed", e);
-      alert("Error loading project file. Is it a .pano file?");
+      alert("Error loading .pano file.");
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const blobToBase64 = (blob: Blob): Promise<string> => {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result as string);
+      reader.readAsDataURL(blob);
+    });
   };
 
   const addScene = useCallback(async (file: File) => {
@@ -134,7 +172,7 @@ const App: React.FC = () => {
     setIsDirty(true);
   }, []);
 
-  const updateHotspot = (updated: Hotspot) => {
+  const updateHotspot = useCallback((updated: Hotspot) => {
     setTour((prev) => {
       const next = {
         ...prev,
@@ -148,37 +186,22 @@ const App: React.FC = () => {
       return next;
     });
     setIsDirty(true);
-  };
+  }, [activeSceneId]);
 
-  const removeScene = (id: string) => {
-    if (!confirm("Remove this scene?")) return;
-    setTour((prev) => {
-      const nextScenes = prev.scenes.filter((s) => s.id !== id);
-      const updated = {
-        ...prev,
-        scenes: nextScenes,
-        startSceneId: prev.startSceneId === id ? (nextScenes[0]?.id || '') : prev.startSceneId,
-      };
-      db.save('current-tour', updated);
-      return updated;
-    });
-    if (activeSceneId === id) {
-      setActiveSceneId(tour.scenes.find((s) => s.id !== id)?.id || '');
-    }
-    setIsDirty(true);
-  };
-
-  const addHotspot = (position: { x: number; y: number; z: number }) => {
+  const addHotspot = useCallback((position: { x: number; y: number; z: number }) => {
     if (!activeSceneId || isPreviewMode) return;
+
+    const newId = crypto.randomUUID();
     const newHotspot: Hotspot = {
-      id: crypto.randomUUID(),
+      id: newId,
       type: HotspotType.SCENE,
-      position,
+      position: { x: position.x, y: position.y, z: position.z },
       label: 'New Hotspot',
       targetSceneId: '',
       targetUrl: '',
       contentImageUrl: '',
     };
+
     setTour((prev) => {
       const updated = {
         ...prev,
@@ -189,11 +212,12 @@ const App: React.FC = () => {
       db.save('current-tour', updated);
       return updated;
     });
-    setSelectedHotspotId(newHotspot.id);
+    
+    setSelectedHotspotId(newId);
     setIsDirty(true);
-  };
+  }, [activeSceneId, isPreviewMode]);
 
-  const removeHotspot = (id: string) => {
+  const removeHotspot = useCallback((id: string) => {
     setTour((prev) => {
       const updated = {
         ...prev,
@@ -206,7 +230,7 @@ const App: React.FC = () => {
     });
     setSelectedHotspotId(null);
     setIsDirty(true);
-  };
+  }, [activeSceneId]);
 
   return (
     <div className="flex h-screen bg-slate-950 text-slate-100 font-sans overflow-hidden">
@@ -215,7 +239,14 @@ const App: React.FC = () => {
         activeSceneId={activeSceneId}
         onSelectScene={setActiveSceneId}
         onAddScene={addScene}
-        onRemoveScene={removeScene}
+        onRemoveScene={(id) => {
+            if (!confirm("Remove this scene?")) return;
+            setTour(prev => {
+                const nextScenes = prev.scenes.filter(s => s.id !== id);
+                return { ...prev, scenes: nextScenes, startSceneId: prev.startSceneId === id ? (nextScenes[0]?.id || '') : prev.startSceneId };
+            });
+            setIsDirty(true);
+        }}
         onLoadProject={loadFromZip}
         onUpdateTourTitle={(title) => { setTour((prev) => ({ ...prev, title })); setIsDirty(true); }}
       />
@@ -226,12 +257,7 @@ const App: React.FC = () => {
             <h1 className="text-xl font-bold bg-gradient-to-r from-blue-400 to-emerald-400 bg-clip-text text-transparent">
               {tour.title}
             </h1>
-            {isDirty && (
-              <span className="flex items-center gap-1.5 text-[10px] bg-amber-500/10 text-amber-500 px-2.5 py-1 rounded-full border border-amber-500/20 uppercase font-black tracking-widest">
-                <Info size={12} />
-                Unsaved
-              </span>
-            )}
+            {isDirty && <span className="text-[10px] bg-amber-500/10 text-amber-500 px-2.5 py-1 rounded-full border border-amber-500/20 uppercase font-black tracking-widest">Unsaved</span>}
           </div>
           
           <div className="flex items-center gap-3">
@@ -241,24 +267,22 @@ const App: React.FC = () => {
               className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg transition-all border border-slate-700 font-medium disabled:opacity-50"
             >
               <Save size={18} />
-              {isLoading ? 'Processing...' : 'Save Project (.pano)'}
+              {isLoading ? 'Processing...' : 'Save .pano'}
             </button>
             <div className="w-px h-6 bg-slate-800 mx-1" />
             <button
               onClick={() => setIsPreviewMode(!isPreviewMode)}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-all font-medium ${
-                isPreviewMode ? 'bg-emerald-600 text-white shadow-lg' : 'bg-slate-800 hover:bg-slate-700 border border-slate-700'
-              }`}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-all font-medium ${isPreviewMode ? 'bg-emerald-600 text-white' : 'bg-slate-800 hover:bg-slate-700 border border-slate-700'}`}
             >
               {isPreviewMode ? <Edit3 size={18} /> : <Eye size={18} />}
-              {isPreviewMode ? 'Exit Preview' : 'Preview'}
+              {isPreviewMode ? 'Editor' : 'Preview'}
             </button>
             <button
               onClick={() => exportTourAsHTML(tour)}
-              className="flex items-center gap-2 px-5 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-white transition-all shadow-lg shadow-blue-900/20 font-bold"
+              className="flex items-center gap-2 px-5 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-white font-bold shadow-lg shadow-blue-900/20"
             >
               <Download size={18} />
-              Export HTML5
+              Export HTML
             </button>
           </div>
         </header>
@@ -272,6 +296,7 @@ const App: React.FC = () => {
                 if (isPreviewMode) {
                   if (hs.type === HotspotType.SCENE && hs.targetSceneId) setActiveSceneId(hs.targetSceneId);
                   else if (hs.type === HotspotType.LINK && hs.targetUrl) window.open(hs.targetUrl, '_blank');
+                  else if (hs.type === HotspotType.IMAGE) setSelectedHotspotId(hs.id);
                 } else {
                   setSelectedHotspotId(hs.id);
                 }
@@ -280,56 +305,23 @@ const App: React.FC = () => {
               isPreviewMode={isPreviewMode}
             />
           ) : (
-            <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950 p-8 text-center">
-              <div className="max-w-md w-full p-10 bg-slate-900/50 rounded-[2.5rem] border border-slate-800 shadow-2xl backdrop-blur-xl">
-                <div className="w-20 h-20 bg-blue-500/10 rounded-3xl flex items-center justify-center mx-auto mb-6 text-blue-500">
-                  <ImageIcon size={40} />
-                </div>
-                
-                <h2 className="text-3xl font-black mb-4 tracking-tight">Virtual Tour Editor</h2>
-                <p className="text-slate-400 mb-10 leading-relaxed text-sm">
-                  Create immersive 360 experiences. No complex setup, works in your browser.
-                </p>
-                
+            <div className="absolute inset-0 flex flex-col items-center justify-center p-8 text-center">
+              <div className="max-w-md w-full p-10 bg-slate-900/50 rounded-[2.5rem] border border-slate-800 backdrop-blur-xl">
+                <ImageIcon size={48} className="text-blue-500 mx-auto mb-6" />
+                <h2 className="text-2xl font-black mb-4 tracking-tight">Panocraft 360 Studio</h2>
                 <div className="flex flex-col gap-3">
-                  <label className="flex items-center justify-center gap-3 px-8 py-4 bg-blue-600 hover:bg-blue-500 rounded-2xl font-bold shadow-xl shadow-blue-900/30 transition-all active:scale-95 cursor-pointer">
+                  <label className="flex items-center justify-center gap-3 px-8 py-4 bg-blue-600 hover:bg-blue-500 rounded-2xl font-bold cursor-pointer transition-all active:scale-95 shadow-lg shadow-blue-900/20">
                     <Plus size={20} />
-                    Add First 360 Image
-                    <input
-                      type="file"
-                      accept="image/*"
-                      className="hidden"
-                      onChange={(e) => e.target.files?.[0] && addScene(e.target.files[0])}
-                    />
+                    New 360 Scene
+                    <input type="file" accept="image/*" className="hidden" onChange={(e) => e.target.files?.[0] && addScene(e.target.files[0])} />
                   </label>
-                  
-                  <label className="flex items-center justify-center gap-3 px-8 py-4 bg-slate-800 hover:bg-slate-700 rounded-2xl font-bold transition-all border border-slate-700 cursor-pointer">
+                  <label className="flex items-center justify-center gap-3 px-8 py-4 bg-slate-800 hover:bg-slate-700 rounded-2xl font-bold border border-slate-700 cursor-pointer transition-all active:scale-95">
                     <Upload size={20} />
                     Load .pano Project
-                    <input
-                      type="file"
-                      accept=".pano"
-                      className="hidden"
-                      onChange={(e) => e.target.files?.[0] && loadFromZip(e.target.files[0])}
-                    />
+                    <input type="file" accept=".pano" className="hidden" onChange={(e) => e.target.files?.[0] && loadFromZip(e.target.files[0])} />
                   </label>
                 </div>
               </div>
-            </div>
-          )}
-
-          {!isPreviewMode && activeScene && (
-            <div className="absolute bottom-6 left-1/2 -translate-x-1/2 pointer-events-none">
-              <div className="bg-slate-900/80 backdrop-blur-md border border-slate-700 px-4 py-2 rounded-full text-[10px] font-bold uppercase tracking-widest text-slate-400">
-                Click on the image to add a hotspot
-              </div>
-            </div>
-          )}
-
-          {isPreviewMode && (
-            <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-emerald-600/90 backdrop-blur-md text-white px-5 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.2em] shadow-2xl border border-white/20 pointer-events-none z-50 flex items-center gap-2">
-              <div className="w-2 h-2 bg-white rounded-full animate-pulse" />
-              Live Preview
             </div>
           )}
         </main>
