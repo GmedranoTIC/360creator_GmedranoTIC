@@ -7,7 +7,7 @@ import HotspotPanel from './components/HotspotPanel';
 import { exportTourAsHTML } from './utils/exportTour';
 import { db } from './utils/db';
 import JSZip from 'jszip';
-import { Plus, Download, Eye, Edit3, Image as ImageIcon, FileArchive, Save, Trash2, Info, Upload } from 'lucide-react';
+import { Plus, Download, Eye, Edit3, Image as ImageIcon, FileArchive, Save, Trash2, Info, Upload, FilePlus } from 'lucide-react';
 
 const App: React.FC = () => {
   const [tour, setTour] = useState<Tour>({
@@ -39,6 +39,28 @@ const App: React.FC = () => {
     };
     init();
   }, []);
+
+  // New Tour function
+  const createNewTour = async () => {
+    if (isDirty) {
+      const confirmNew = confirm("You have unsaved changes. Start a new tour anyway?");
+      if (!confirmNew) return;
+    }
+    
+    const newTour: Tour = {
+      title: 'My 360 Tour',
+      startSceneId: '',
+      scenes: [],
+    };
+    
+    setTour(newTour);
+    setActiveSceneId('');
+    setSelectedHotspotId(null);
+    setIsDirty(false);
+    
+    // Clear the saved tour from IndexedDB
+    await db.save('current-tour', newTour);
+  };
 
   // Save to ZIP (.pano)
   const saveToZip = async () => {
@@ -261,6 +283,13 @@ const App: React.FC = () => {
           </div>
           
           <div className="flex items-center gap-3">
+            <button
+              onClick={createNewTour}
+              className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg transition-all border border-slate-700 font-medium"
+            >
+              <FilePlus size={18} />
+              New Tour
+            </button>
             <button
               onClick={saveToZip}
               disabled={isLoading}

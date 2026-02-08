@@ -1,34 +1,66 @@
 
 import { Tour } from '../types';
+import JSZip from 'jszip';
 
 export const exportTourAsHTML = async (tour: Tour) => {
-  // For export, we need to convert current Blob URLs or local files to base64
-  // so the single HTML file is truly portable as requested.
-  const scenesWithBase64 = await Promise.all(
-    tour.scenes.map(async (scene) => {
-      if (!scene.imageSource) return scene;
-      try {
-        const response = await fetch(scene.imageSource);
-        const blob = await response.blob();
-        return new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            resolve({ ...scene, imageSource: reader.result as string });
-          };
-          reader.readAsDataURL(blob);
-        });
-      } catch (e) {
-        console.error("Failed to convert image for export", e);
-        return scene;
+  const zip = new JSZip();
+  const imagesFolder = zip.folder('images');
+  
+  if (!imagesFolder) {
+    alert('Error creating images folder');
+    return;
+  }
+
+  // Process scenes and save images to the zip
+  const processedScenes = await Promise.all(
+    tour.scenes.map(async (scene, index) => {
+      let imagePath = '';
+      
+      if (scene.imageSource) {
+        try {
+          const response = await fetch(scene.imageSource);
+          const blob = await response.blob();
+          const imageFileName = scene.imageFileName || `scene_${index}.jpg`;
+          imagesFolder.file(imageFileName, blob);
+          imagePath = `images/${imageFileName}`;
+        } catch (e) {
+          console.error("Failed to process image for export", e);
+        }
       }
+
+      // Process hotspot images
+      const processedHotspots = await Promise.all(
+        scene.hotspots.map(async (hs) => {
+          if (hs.type === 'IMAGE' && hs.contentImageUrl) {
+            try {
+              if (hs.contentImageUrl.startsWith('data:')) {
+                // Convert base64 to blob and save
+                const response = await fetch(hs.contentImageUrl);
+                const blob = await response.blob();
+                const hotspotImageName = `hotspot_${hs.id}.jpg`;
+                imagesFolder.file(hotspotImageName, blob);
+                return { ...hs, contentImageUrl: `images/${hotspotImageName}` };
+              }
+            } catch (e) {
+              console.error("Failed to process hotspot image", e);
+            }
+          }
+          return hs;
+        })
+      );
+
+      return { 
+        ...scene, 
+        imageSource: imagePath,
+        hotspots: processedHotspots
+      };
     })
   );
 
-  const exportedTour = { ...tour, scenes: scenesWithBase64 };
+  const exportedTour = { ...tour, scenes: processedScenes };
   const tourData = JSON.stringify(exportedTour);
 
-  const htmlContent = `
-<!DOCTYPE html>
+  const htmlContent = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -272,16 +304,24 @@ export const exportTourAsHTML = async (tour: Tour) => {
         }
     </script>
 </body>
-</html>
-  `;
+</html>`;
 
-  const blob = new Blob([htmlContent], { type: 'text/html' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `${tour.title.replace(/\s+/g, '_')}_tour.html`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  // Add HTML file to zip
+  zip.file('index.html', htmlContent);
+
+  // Generate and download the zip
+  try {
+    const content = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(content);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${tour.title.replace(/\s+/g, '_')}_tour.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    console.error("ZIP generation failed", e);
+    alert("Failed to create tour export.");
+  }
 };
